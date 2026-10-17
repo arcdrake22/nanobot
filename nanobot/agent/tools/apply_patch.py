@@ -48,7 +48,9 @@ def _append_text(content: str, addition: str) -> str:
             items=ObjectSchema(
                 path=StringSchema(
                     "Path to the file to edit. Relative paths resolve against the "
-                    "workspace; absolute paths and '..' obey the workspace access policy."
+                    "workspace; absolute paths and '..' obey the workspace access policy. "
+                    "Optional when a top-level path is supplied.",
+                    nullable=True,
                 ),
                 action=StringSchema(
                     "replace updates a unique text match; add creates a file or appends to an existing one.",
@@ -62,11 +64,17 @@ def _append_text(content: str, addition: str) -> str:
                     "Text to replace with or append. Required for replace and add.",
                     nullable=True,
                 ),
-                required=["path", "action"],
+                required=["action"],
+                additional_properties=False,
             ),
             description="File edits, applied in order.",
             min_items=1,
             max_items=20,
+        ),
+        path=StringSchema(
+            "Default path for every edit that omits its own. Saves repeating one "
+            "path across a patch that touches a single file.",
+            nullable=True,
         ),
         dry_run=BooleanSchema(
             description="Validate and summarize the patch without writing files.",
@@ -87,6 +95,8 @@ class ApplyPatchTool(_FsTool):
     def description(self) -> str:
         return (
             "Default tool for code edits, including multi-file changes. "
+            "Each edit carries its own path, or one top-level path may be given "
+            "for a patch that touches a single file. "
             "Returns a file-change summary. "
             "Use edit_file only for small exact replacements on a single file."
         )
@@ -94,9 +104,15 @@ class ApplyPatchTool(_FsTool):
     async def execute(
         self,
         edits: list[object] | None = None,
+        path: str | None = None,
         dry_run: bool = False,
         **kwargs: Any,
     ) -> str:
+        # A patch that touches one file reads better with its path given once, so
+        # a top-level path is inherited by every edit that omits its own.
+        # Validation accepts either shape; filling the gap happens here, once,
+        # which leaves the per-edit path authoritative.
+        default_path = path
         try:
             if not edits:
                 raise _PatchError("must provide edits")
@@ -110,18 +126,25 @@ class ApplyPatchTool(_FsTool):
                     raise _PatchError("each edit must be an object")
                 edit = cast(dict[str, Any], edit_value)
                 raw_path = edit.get("path")
+                if raw_path is None:
+                    raw_path = default_path
+                if raw_path is None:
+                    raise _PatchError(
+                        "path required for edit: give each edit a path, or pass one "
+                        "top-level path for all of them"
+                    )
                 if not isinstance(raw_path, str):
-                    raise _PatchError("path required for edit")
-                path = _validate_patch_path(raw_path)
+                    raise _PatchError(f"path must be a string: {raw_path!r}")
+                edit_path = _validate_patch_path(raw_path)
                 action = edit.get("action")
                 if not isinstance(action, str):
-                    raise _PatchError(f"action required for edit: {path}")
-                source = self._resolve_write(path)
+                    raise _PatchError(f"action required for edit: {edit_path}")
+                source = self._resolve_write(edit_path)
 
                 if action == "add":
                     new_text = edit.get("new_text")
                     if new_text is None:
-                        raise _PatchError(f"new_text required for add: {path}")
+                        raise _PatchError(f"new_text required for add: {edit_path}")
                     new_text = cast(str, new_text)
 
                     pending = writes.get(source)
@@ -133,7 +156,7 @@ class ApplyPatchTool(_FsTool):
                         try:
                             content = raw.decode("utf-8")
                         except UnicodeDecodeError:
-                            raise _PatchError(f"file is not UTF-8 text: {path}")
+                            raise _PatchError(f"file is not UTF-8 text: {edit_path}")
                         exists = True
                     else:
                         content = ""
@@ -156,11 +179,11 @@ class ApplyPatchTool(_FsTool):
                 elif action == "replace":
                     old_text = edit.get("old_text") or ""
                     if not old_text:
-                        raise _PatchError(f"old_text required for replace: {path}")
+                        raise _PatchError(f"old_text required for replace: {edit_path}")
                     old_text = cast(str, old_text)
                     new_text = edit.get("new_text")
                     if new_text is None:
-                        raise _PatchError(f"new_text required for replace: {path}")
+                        raise _PatchError(f"new_text required for replace: {edit_path}")
                     new_text = cast(str, new_text)
 
                     pending = writes.get(source)
@@ -171,12 +194,12 @@ class ApplyPatchTool(_FsTool):
                         try:
                             content = raw.decode("utf-8")
                         except UnicodeDecodeError:
-                            raise _PatchError(f"file is not UTF-8 text: {path}")
+                            raise _PatchError(f"file is not UTF-8 text: {edit_path}")
                     else:
-                        raise _PatchError(f"file to update does not exist: {path}")
+                        raise _PatchError(f"file to update does not exist: {edit_path}")
 
                     if pending is None and not source.is_file():
-                        raise _PatchError(f"path to update is not a file: {path}")
+                        raise _PatchError(f"path to update is not a file: {edit_path}")
 
                     uses_crlf = "\r\n" in content
                     norm_content = content.replace("\r\n", "\n")
@@ -184,9 +207,9 @@ class ApplyPatchTool(_FsTool):
 
                     pos = norm_content.find(norm_old)
                     if pos < 0:
-                        raise _PatchError(f"old_text not found in {path}")
+                        raise _PatchError(f"old_text not found in {edit_path}")
                     if norm_content.find(norm_old, pos + 1) >= 0:
-                        raise _PatchError(f"old_text appears multiple times in {path}")
+                        raise _PatchError(f"old_text appears multiple times in {edit_path}")
 
                     new_norm = (
                         norm_content[:pos]
@@ -214,34 +237,36 @@ class ApplyPatchTool(_FsTool):
             summaries: list[str] = []
             for source, diff in diffs.items():
                 action_name = actions[source]
-                path = display_file_edit_path(source, self._display_workspace())
+                shown = display_file_edit_path(source, self._display_workspace())
                 added, deleted = diff.added, diff.deleted
                 stats = f" (+{added}/-{deleted})" if added or deleted else ""
-                summaries.append(f"- {action_name} {path}{stats}")
+                summaries.append(f"- {action_name} {shown}{stats}")
 
             if dry_run:
                 return "Patch dry-run succeeded:\n" + "\n".join(summaries)
 
             backups: dict[Path, bytes | None] = {}
-            for path in writes:
-                backups[path] = path.read_bytes() if path.exists() else None
+            for target_path in writes:
+                backups[target_path] = (
+                    target_path.read_bytes() if target_path.exists() else None
+                )
 
             try:
-                for path, content in writes.items():
-                    path.parent.mkdir(parents=True, exist_ok=True)
-                    path.write_text(content, encoding="utf-8", newline="")
+                for target_path, content in writes.items():
+                    target_path.parent.mkdir(parents=True, exist_ok=True)
+                    target_path.write_text(content, encoding="utf-8", newline="")
             except Exception:
-                for path, data in backups.items():
+                for target_path, data in backups.items():
                     if data is None:
-                        if path.exists():
-                            path.unlink()
+                        if target_path.exists():
+                            target_path.unlink()
                     else:
-                        path.parent.mkdir(parents=True, exist_ok=True)
-                        path.write_bytes(data)
+                        target_path.parent.mkdir(parents=True, exist_ok=True)
+                        target_path.write_bytes(data)
                 raise
 
-            for path in writes:
-                self._file_states.record_write(path)
+            for target_path in writes:
+                self._file_states.record_write(target_path)
             return FileEditResult("Patch applied:\n" + "\n".join(summaries), diffs)
         except PermissionError as exc:
             return ToolResult.error(f"Error: {exc}")
